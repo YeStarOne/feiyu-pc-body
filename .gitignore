@@ -1,0 +1,18 @@
+# 令牌/运行时/隐私——绝不入库
+.eye-token
+*.token
+*.log
+notes.jsonl
+notes-*.jsonl
+ledger.jsonl
+standalone-runtime.json
+FORCE_GO*
+# 桌宠本体与资源（疑似含游戏解包资源，绝不公开）
+assets/
+node_modules/
+lib/
+package.json
+package-lock.json
+# 杂物
+__pycache__/
+*.pyc
