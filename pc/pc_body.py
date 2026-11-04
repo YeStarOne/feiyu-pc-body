@@ -25,9 +25,11 @@ import ctypes.wintypes as wt
 import json
 import logging
 import os
+import queue
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -72,6 +74,8 @@ BLACKLIST_PROC = ['ths', 'hexin', 'tdx', 'wenhua', 'trader', 'vnpy', 'vn_',
 BLACKLIST_PROC_EXACT = ['qq.exe']
 BLACKLIST_TITLE = ['同花顺', '通达信', '交易', '下单', '密码', '委托']
 GAME_PROC = ['stardew']
+# 平板投屏（scrcpy 窗口存在 = 主人在平板上看视频）：优先于前台窗口抓取
+SCRCPY_PROC = 'scrcpy.exe'
 
 user32 = ctypes.windll.user32
 logging.basicConfig(
@@ -141,9 +145,47 @@ def blacklisted(proc, title):
 
 def app_type_of(proc):
     p = (proc or '').lower()
+    if p == SCRCPY_PROC:
+        return 'video'
     if any(k in p for k in GAME_PROC):
         return 'game'
     return 'other'
+
+
+def find_scrcpy_window():
+    """找 scrcpy 投屏窗口（平板镜像）——优先于前台窗口：主人看平板时 PC 不必在前台。
+    返回 (proc, title, rect) 或 None"""
+    found = []
+    try:
+        @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        def cb(h, l):
+            try:
+                if not user32.IsWindowVisible(h):
+                    return True
+                pid = wt.DWORD()
+                user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                try:
+                    proc = psutil.Process(pid.value).name().lower()
+                except Exception:
+                    return True
+                if proc != SCRCPY_PROC:
+                    return True
+                n = user32.GetWindowTextLengthW(h)
+                buf = ctypes.create_unicode_buffer(max(n, 1) + 1)
+                user32.GetWindowTextW(h, buf, n + 1)
+                r = wt.RECT()
+                user32.GetWindowRect(h, ctypes.byref(r))
+                w, hh = r.right - r.left, r.bottom - r.top
+                # 最小化窗口的 rect 在 (-32000,-32000)，抓了是黑帧——跳过
+                if w > 200 and hh > 150 and r.left > -500 and r.top > -500:
+                    found.append((proc, buf.value or '平板投屏', (r.left, r.top, w, hh)))
+            except Exception:
+                pass
+            return True
+        user32.EnumWindows(cb, 0)
+    except Exception:
+        pass
+    return found[0] if found else None
 
 
 def grab_frames(rect, count=FRAME_COUNT):
@@ -228,12 +270,18 @@ def eye_round():
             STATE['pause_reason'] = 'daily-limit-local'
             log.warning('闸2 触发: 日限额 %dMB 用完，眼睛暂停', DAILY_LIMIT // 1048576)
             return 'daily-limit'
-    info = win_info()
-    if not info:
-        return 'no-window'
-    hwnd, pid, proc, title, rect = info
-    if blacklisted(proc, title):
-        return 'blacklisted'
+    # 平板投屏优先：scrcpy 窗口存在 = 主人在平板上看视频，抓它（不管 PC 前台是什么）
+    tablet = find_scrcpy_window()
+    if tablet:
+        proc, title, rect = tablet
+        title = ('平板投屏 · ' + title)[:80]
+    else:
+        info = win_info()
+        if not info:
+            return 'no-window'
+        hwnd, pid, proc, title, rect = info
+        if blacklisted(proc, title):
+            return 'blacklisted'
     # 抓帧
     try:
         frames = grab_frames(rect)
@@ -370,6 +418,66 @@ def pet_forward(path_qs, payload=None, method='POST'):
         return json.loads(r.read().decode('utf-8', 'replace'))
 
 
+# ── 平板桌宠：SSE 事件广播 + 网页 ──────────────────────────────
+SSE_SUBS = []
+
+
+def sse_publish(obj):
+    for q in list(SSE_SUBS):
+        try:
+            q.put_nowait(obj)
+        except Exception:
+            pass
+
+
+PET_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>肥鱼 · 平板桌宠</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b1220;color:#dbe6ff;
+    font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;overflow:hidden}
+  #stage{position:relative;height:100%;display:flex;flex-direction:column;
+    align-items:center;justify-content:flex-end;padding-bottom:6vh}
+  #bubble{max-width:86vw;background:rgba(20,32,58,.93);border:1px solid #2a3f6e;
+    border-radius:18px;padding:14px 18px;font-size:18px;line-height:1.5;
+    margin-bottom:18px;opacity:0;transition:opacity .4s;box-shadow:0 6px 24px rgba(0,0,0,.45)}
+  #bubble.show{opacity:1}
+  #fish{width:min(44vw,300px)}
+  video{width:100%;display:block}
+  #hist{position:fixed;top:8px;left:10px;right:10px;font-size:12px;color:#7f92c0;
+    max-height:16vh;overflow:hidden;display:flex;flex-direction:column-reverse;gap:2px}
+  #offline{position:fixed;top:8px;right:10px;font-size:12px;color:#e2564f;display:none}
+</style></head><body>
+<div id="hist"></div><div id="offline">连接断开，重连中…</div>
+<div id="stage"><div id="bubble"></div><div id="fish"><video id="v" autoplay loop muted playsinline></video></div></div>
+<script>
+const q = new URLSearchParams(location.search);
+const fish = document.getElementById('v'), bubble = document.getElementById('bubble'),
+      hist = document.getElementById('hist'), off = document.getElementById('offline');
+function play(name){ if(!name) return;
+  fish.src = '/anim-file?token=' + q.get('token') + '&name=' + encodeURIComponent(name);
+  fish.onerror = ()=>{ fish.onerror = null; fish.src = ''; };
+}
+let hideT;
+function say(text, anim){
+  bubble.textContent = text; bubble.classList.add('show');
+  clearTimeout(hideT); hideT = setTimeout(()=>bubble.classList.remove('show'), 12000);
+  const d = document.createElement('div'); d.textContent = '• ' + text; hist.appendChild(d);
+  if (hist.children.length > 5) hist.removeChild(hist.firstChild);
+  if (anim) play(anim);
+}
+play('待机呼吸休闲');
+function connect(){
+  const es = new EventSource('/events?token=' + q.get('token'));
+  es.onopen = ()=>{ off.style.display = 'none'; };
+  es.onmessage = (e)=>{ try{ const m = JSON.parse(e.data);
+    if(m.type==='say') say(m.text, m.anim); else if(m.type==='anim') play(m.name);}catch(_){} };
+  es.onerror = ()=>{ off.style.display = 'block'; es.close(); setTimeout(connect, 4000); };
+}
+connect();
+</script></body></html>"""
+
+
 class Bridge(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -385,19 +493,83 @@ class Bridge(BaseHTTPRequestHandler):
     def _auth(self):
         return self.headers.get('Authorization', '') == 'Bearer ' + TOKEN
 
+    def _qtoken_ok(self, params):
+        """平板桌宠网页用的 query token（仅绑 Tailscale 网卡，不出公网）"""
+        return (params.get('token') or [''])[0] == TOKEN
+
     def do_GET(self):
+        path, _, qs = self.path.partition('?')
+        params = urllib.parse.parse_qs(qs)
+        # ── 平板桌宠网页三件套（query token，仅 Tailscale 内网可达）──
+        if path == '/pet':
+            if not self._qtoken_ok(params):
+                return self._json({'error': 'unauthorized'}, 401)
+            body = PET_PAGE.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == '/anim-file':
+            if not self._qtoken_ok(params):
+                return self._json({'error': 'unauthorized'}, 401)
+            name = (params.get('name') or [''])[0].strip()
+            root = (BASE_DIR / 'assets' / 'webm').resolve()
+            f = (root / (name + '.webm')).resolve() if name else None
+            if not name or f is None or not str(f).startswith(str(root)) or not f.exists():
+                return self._json({'error': 'no-such-anim'}, 404)
+            body = f.read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type', 'video/webm')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'max-age=86400')
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == '/events':
+            if not self._qtoken_ok(params):
+                return self._json({'error': 'unauthorized'}, 401)
+            q = queue.Queue(maxsize=64)
+            SSE_SUBS.append(q)
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Connection', 'keep-alive')
+                self.end_headers()
+                self.wfile.write(b': hello\n\n')
+                self.wfile.flush()
+                while True:
+                    try:
+                        obj = q.get(timeout=15)
+                        data = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+                        self.wfile.write(b'data: ' + data + b'\n\n')
+                    except queue.Empty:
+                        self.wfile.write(b': ping\n\n')
+                    self.wfile.flush()
+            except Exception:
+                pass  # 客户端断开属正常
+            finally:
+                try:
+                    SSE_SUBS.remove(q)
+                except ValueError:
+                    pass
+            return
+        # ── 原有 Bearer 接口 ──
         if not self._auth():
             return self._json({'error': 'unauthorized'}, 401)
-        path = self.path.split('?')[0]
         if path == '/health':
             eye_state = {k: STATE[k] for k in ('paused', 'pause_reason', 'day_bytes', 'pub_route')}
+            tablet = 'yes' if find_scrcpy_window() else 'no'
             try:
                 pet = pet_forward('/state?pet=main', method='GET')
                 pet_ok = True
             except Exception as e:
                 pet_ok = False
                 pet = {'error': str(e)[:100]}
-            return self._json({'ok': True, 'eye': eye_state, 'pet_alive': pet_ok})
+            return self._json({'ok': True, 'eye': eye_state, 'pet_alive': pet_ok,
+                               'tablet_window': tablet})
         return self._json({'error': 'not-found'}, 404)
 
     def do_POST(self):
@@ -420,9 +592,11 @@ class Bridge(BaseHTTPRequestHandler):
                                  {'text': text, 'duration': int(payload.get('duration', 12000))})
                 anim = payload.get('anim')
                 r2 = pet_forward(f'/anim{qs}', {'name': anim}) if anim else None
+                sse_publish({'type': 'say', 'text': text, 'anim': anim})
                 return self._json({'ok': True, 'broadcast': r1, 'anim': r2})
             if path == '/anim':
                 r = pet_forward('/anim?pet=main&surface=desktop', {'name': payload.get('name', '')})
+                sse_publish({'type': 'anim', 'name': payload.get('name', '')})
                 return self._json({'ok': True, 'anim': r})
             if path == '/pet-state':
                 r = pet_forward('/state?pet=main', method='GET')
