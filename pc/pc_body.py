@@ -74,8 +74,17 @@ BLACKLIST_PROC = ['ths', 'hexin', 'tdx', 'wenhua', 'trader', 'vnpy', 'vn_',
 BLACKLIST_PROC_EXACT = ['qq.exe']
 BLACKLIST_TITLE = ['同花顺', '通达信', '交易', '下单', '密码', '委托']
 GAME_PROC = ['stardew']
-# 平板投屏（scrcpy 窗口存在 = 主人在平板上看视频）：优先于前台窗口抓取
-SCRCPY_PROC = 'scrcpy.exe'
+# 平板投屏窗口（主人在平板上看视频）：优先于前台窗口抓取，三条通道都认——
+#   scrcpy（USB/WiFi adb 镜像）/ 华为电脑管家多屏协同 / Windows 无线显示器(Miracast)
+MIRROR_PROC = ['scrcpy.exe']
+MIRROR_PROC_KW = ['pcmanager', 'wwahost']          # 华为管家 / Connect 应用宿主（旧版 Win10）
+MIRROR_HOST_PROC = ['applicationframehost.exe']    # UWP 窗口宿主（Win11「无线显示器」接收端挂这里）
+MIRROR_TITLE_KW = ['MatePad', 'HUAWEI', '投屏', '协同', '无线显示器', 'Screen Mirroring',
+                   '连接']                          # 「连接」=Win+K Miracast 接收窗
+MIRROR_STANDBY_TITLES = ['无线显示器', '连接', 'connect', 'wireless display']
+# ↑ 接收端「待机界面」的标题：窗口这么小说明没设备连着，抓了就是蓝屏白烧 token
+_STANDBY_LAST = [0.0]                               # 待机日志节流
+_SCREEN_AREA = []                                   # 首次用到时求值（user32 在后面才定义）
 
 user32 = ctypes.windll.user32
 logging.basicConfig(
@@ -145,16 +154,25 @@ def blacklisted(proc, title):
 
 def app_type_of(proc):
     p = (proc or '').lower()
-    if p == SCRCPY_PROC:
+    if p in MIRROR_PROC or any(k in p for k in MIRROR_PROC_KW + MIRROR_HOST_PROC):
         return 'video'
     if any(k in p for k in GAME_PROC):
         return 'game'
     return 'other'
 
 
-def find_scrcpy_window():
-    """找 scrcpy 投屏窗口（平板镜像）——优先于前台窗口：主人看平板时 PC 不必在前台。
-    返回 (proc, title, rect) 或 None"""
+def screen_area():
+    """主屏面积（进程非 DPI-aware 时 GetWindowRect 与 GetSystemMetrics 同处
+    虚拟化坐标，两者比例依然成立——只判「窗口铺没铺满」，不要求绝对像素）"""
+    if not _SCREEN_AREA:
+        _SCREEN_AREA.append(max(user32.GetSystemMetrics(0), 1)
+                            * max(user32.GetSystemMetrics(1), 1))
+    return _SCREEN_AREA[0]
+
+
+def find_mirror_window():
+    """找平板投屏窗口（scrcpy / 华为多屏协同 / 无线显示器）——优先于前台窗口：
+    主人看平板时 PC 不必在前台。返回 (proc, title, rect) 或 None"""
     found = []
     try:
         @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
@@ -168,17 +186,34 @@ def find_scrcpy_window():
                     proc = psutil.Process(pid.value).name().lower()
                 except Exception:
                     return True
-                if proc != SCRCPY_PROC:
-                    return True
                 n = user32.GetWindowTextLengthW(h)
                 buf = ctypes.create_unicode_buffer(max(n, 1) + 1)
                 user32.GetWindowTextW(h, buf, n + 1)
+                title = buf.value or ''
+                hit = proc in MIRROR_PROC
+                if not hit and any(k in proc for k in MIRROR_PROC_KW) \
+                        and any(k.lower() in title.lower() for k in MIRROR_TITLE_KW):
+                    hit = True
+                if not hit and proc in MIRROR_HOST_PROC \
+                        and any(k.lower() in title.lower() for k in MIRROR_TITLE_KW):
+                    hit = True
+                if not hit and any(k.lower() in title.lower() for k in MIRROR_TITLE_KW) \
+                        and any(k in proc for k in ('pcmanager', 'wwahost', 'connect')):
+                    hit = True
+                if not hit:
+                    return True
                 r = wt.RECT()
                 user32.GetWindowRect(h, ctypes.byref(r))
                 w, hh = r.right - r.left, r.bottom - r.top
                 # 最小化窗口的 rect 在 (-32000,-32000)，抓了是黑帧——跳过
                 if w > 200 and hh > 150 and r.left > -500 and r.top > -500:
-                    found.append((proc, buf.value or '平板投屏', (r.left, r.top, w, hh)))
+                    # 待机界面 = 还没设备连进来（抓了就是一张静态蓝屏）。
+                    # 判据 = 标题命中「待机」且窗口没铺满屏幕；真正投上来时
+                    # Miracast 会新建虚拟显示器并把接收端铺满，窗口面积会暴涨。
+                    standby = (any(s in title.lower() for s in MIRROR_STANDBY_TITLES)
+                               and w * hh < 0.55 * screen_area())
+                    found.append((proc, title or '平板投屏', (r.left, r.top, w, hh), standby))
+                    log.debug('mirror cand: %s | %s | %dx%d standby=%s', proc, title, w, hh, standby)
             except Exception:
                 pass
             return True
@@ -270,10 +305,17 @@ def eye_round():
             STATE['pause_reason'] = 'daily-limit-local'
             log.warning('闸2 触发: 日限额 %dMB 用完，眼睛暂停', DAILY_LIMIT // 1048576)
             return 'daily-limit'
-    # 平板投屏优先：scrcpy 窗口存在 = 主人在平板上看视频，抓它（不管 PC 前台是什么）
-    tablet = find_scrcpy_window()
+    # 平板投屏优先：投屏窗口存在 = 主人在平板上看视频，抓它（不管 PC 前台是什么）
+    tablet = find_mirror_window()
     if tablet:
-        proc, title, rect = tablet
+        proc, title, rect, standby = tablet
+        if standby:
+            # 「连接」接收端开着但还没有设备连上来 —— 别抓那张静态待机画面
+            now = time.time()
+            if now - _STANDBY_LAST[0] > 300:
+                _STANDBY_LAST[0] = now
+                log.info('投屏接收端待机中（%s），等平板连进来', title)
+            return 'mirror-standby'
         title = ('平板投屏 · ' + title)[:80]
     else:
         info = win_info()
@@ -561,7 +603,13 @@ class Bridge(BaseHTTPRequestHandler):
             return self._json({'error': 'unauthorized'}, 401)
         if path == '/health':
             eye_state = {k: STATE[k] for k in ('paused', 'pause_reason', 'day_bytes', 'pub_route')}
-            tablet = 'yes' if find_scrcpy_window() else 'no'
+            tablet = find_mirror_window()
+            if not tablet:
+                tablet_state = 'no'
+            elif tablet[3]:
+                tablet_state = 'standby'      # 接收端开着，平板还没投上来
+            else:
+                tablet_state = 'yes'
             try:
                 pet = pet_forward('/state?pet=main', method='GET')
                 pet_ok = True
@@ -569,7 +617,7 @@ class Bridge(BaseHTTPRequestHandler):
                 pet_ok = False
                 pet = {'error': str(e)[:100]}
             return self._json({'ok': True, 'eye': eye_state, 'pet_alive': pet_ok,
-                               'tablet_window': tablet})
+                               'tablet_window': tablet_state})
         return self._json({'error': 'not-found'}, 404)
 
     def do_POST(self):
