@@ -27,6 +27,7 @@ import logging
 import os
 import queue
 import re as _re
+import socket
 import subprocess
 import sys
 import threading
@@ -501,6 +502,7 @@ def eye_round():
                 tab_jpeg = None          # 平板画面没动 = 没人在平板上看东西
         else:
             tab_jpeg = None
+            HDC_STATE['ok_at'] = 0.0     # 快照失败 = key 可能过期（WiFi 重连换端口），下轮重查
 
     if tab_jpeg:
         jpegs = [tab_jpeg]
@@ -509,7 +511,8 @@ def eye_round():
             jb = shrink_jpeg(hdc_snapshot(tab_key) or b'')
             if jb.startswith(b'\xff\xd8'):
                 jpegs.append(jb)
-        proc, title, app_type = 'hdc.exe', '平板屏幕 · hdc(USB)', 'video'
+        proc, title, app_type = 'hdc.exe', \
+            ('平板屏幕 · hdc(WiFi)' if ':' in (tab_key or '') else '平板屏幕 · hdc(USB)'), 'video'
         frames = [(jb,) + jpeg_wh(jb) for jb in jpegs]
     else:
         # 平板投屏优先：投屏窗口存在 = 主人在平板上看视频，抓它（不管 PC 前台是什么）
@@ -828,7 +831,8 @@ class Bridge(BaseHTTPRequestHandler):
                 pet = {'error': str(e)[:100]}
             return self._json({'ok': True, 'eye': eye_state, 'pet_alive': pet_ok,
                                'tablet_window': tablet_state,
-                               'tablet_hdc': 'yes' if hdc_target() else 'no'})
+                               'tablet_hdc': 'yes' if hdc_target() else 'no',
+                               'tablet_tunnel': HDC_STATE.get('tunnel', 'no')})
         return self._json({'error': 'not-found'}, 404)
 
     def do_POST(self):
@@ -874,6 +878,102 @@ class BridgeServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
+# ── 平板桌宠隧道（hdc rport 反向转发）────────────────────────
+# 桥只绑 Tailscale IP，平板走不到。利用 hdc 的反向转发：平板 localhost:17860
+# → PC 127.0.0.1:17866（本中继，仅绑回环零暴露）→ 桥（Tailscale IP）。
+# 平板浏览器开 http://127.0.0.1:17860/pet?token=... 即桌宠页，走 USB 或 WiFi 都行。
+TUNNEL_PORT = 17866
+
+def _relay_pipe(client):
+    """单向双工搬运：客户端(设备端隧道) ↔ 桥"""
+    try:
+        up = socket.create_connection((BRIDGE_BIND, BRIDGE_PORT), timeout=5)
+    except Exception:
+        try:
+            client.close()
+        except Exception:
+            pass
+        return
+
+    def pump(a, b):
+        try:
+            while True:
+                d = a.recv(65536)
+                if not d:
+                    break
+                b.sendall(d)
+        except Exception:
+            pass
+        try:
+            b.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+
+    threads = [threading.Thread(target=pump, args=(a, b), daemon=True)
+               for a, b in ((client, up), (up, client))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for s in (client, up):
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def tunnel_relay_loop():
+    """本机回环中继：127.0.0.1:TUNNEL_PORT → 桥。独占绑定（不设 SO_REUSEADDR，
+    双实例只有一个胜者，输家静默放弃——平板隧道不依赖哪个实例活着都行）"""
+    srv = socket.socket()
+    try:
+        srv.bind(('127.0.0.1', TUNNEL_PORT))
+    except OSError as e:
+        log.info('tunnel relay %d 被占（另一实例已接管中继），跳过', TUNNEL_PORT)
+        return
+    srv.listen(8)
+    log.info('tablet tunnel relay: 127.0.0.1:%d -> %s:%d', TUNNEL_PORT, BRIDGE_BIND, BRIDGE_PORT)
+    while True:
+        try:
+            client, _ = srv.accept()
+            threading.Thread(target=_relay_pipe, args=(client,), daemon=True).start()
+        except Exception:
+            time.sleep(1)
+
+
+def tunnel_keeper_loop():
+    """每 15s 保证「在线设备 ↔ 桌宠隧道」存在：优先 WiFi(TCP) 连接，只有 USB 时用 USB。
+    rport 任务随连接断开自动消亡，重连后这里会自动重建，无需人工干预"""
+    while True:
+        try:
+            r = subprocess.run([str(HDC_EXE), 'list', 'targets'], capture_output=True,
+                               timeout=10, creationflags=HDC_CREATE_NO_WINDOW)
+            keys = [l.strip() for l in r.stdout.decode('utf-8', 'replace').splitlines()
+                    if l.strip() and l.strip() != '[Empty]']
+            tcp_keys = [k for k in keys if ':' in k]        # WiFi 连接形如 ip:port
+            targets = tcp_keys or keys[:1]
+            if targets:
+                ls = subprocess.run([str(HDC_EXE), 'fport', 'ls'], capture_output=True,
+                                    timeout=10, creationflags=HDC_CREATE_NO_WINDOW)
+                have = ls.stdout.decode('utf-8', 'replace')
+                for k in targets:
+                    if k in have and 'tcp:17860' in have:
+                        HDC_STATE['tunnel'] = k
+                        continue
+                    rr = subprocess.run([str(HDC_EXE), '-t', k, 'rport',
+                                         'tcp:17860', 'tcp:%d' % TUNNEL_PORT],
+                                        capture_output=True, timeout=10,
+                                        creationflags=HDC_CREATE_NO_WINDOW)
+                    if b'OK' in rr.stdout + rr.stderr:
+                        HDC_STATE['tunnel'] = k
+                        log.info('平板桌宠隧道已建立（%s）: 设备 17860 -> PC %d', k, TUNNEL_PORT)
+            elif 'tunnel' in HDC_STATE:
+                HDC_STATE.pop('tunnel', None)
+        except Exception as e:
+            log.debug('tunnel keeper: %s', e)
+        time.sleep(15)
+
+
 def bridge_loop():
     try:
         srv = BridgeServer((BRIDGE_BIND, BRIDGE_PORT), Bridge)
@@ -892,5 +992,7 @@ def bridge_loop():
 if __name__ == '__main__':
     log.info('pc_body start | token=%s... | eye_servers=%s', TOKEN[:8], EYE_SERVERS)
     threading.Thread(target=bridge_loop, daemon=True, name='Bridge').start()
+    threading.Thread(target=tunnel_relay_loop, daemon=True, name='TunnelRelay').start()
+    threading.Thread(target=tunnel_keeper_loop, daemon=True, name='TunnelKeeper').start()
     time.sleep(1)
     eye_loop()
