@@ -68,9 +68,10 @@ FAIL_COOL_MAX = 300
 MAX_ROUND_BYTES = 1536 * 1024   # 闸1
 
 # ── 闸0 黑名单 ───────────────────────────────────────────
-# 进程名子串匹配（小写）+ 窗口标题子串匹配。用户 2026-11-04 拍板的清单。
+# 进程名子串匹配（小写）+ 窗口标题子串匹配。用户 2026-11-04 拍板的清单，
+# 2026-11-05 追加 zcode（编辑器盖满屏幕时她看着代码框没意义，纯烧 token）。
 BLACKLIST_PROC = ['ths', 'hexin', 'tdx', 'wenhua', 'trader', 'vnpy', 'vn_',
-                  '1password', 'keepass', 'bitwarden', 'enpass']
+                  '1password', 'keepass', 'bitwarden', 'enpass', 'zcode']
 BLACKLIST_PROC_EXACT = ['qq.exe']
 BLACKLIST_TITLE = ['同花顺', '通达信', '交易', '下单', '密码', '委托']
 GAME_PROC = ['stardew']
@@ -307,15 +308,16 @@ def eye_round():
             return 'daily-limit'
     # 平板投屏优先：投屏窗口存在 = 主人在平板上看视频，抓它（不管 PC 前台是什么）
     tablet = find_mirror_window()
+    if tablet and tablet[3]:
+        # 接收端开着但没设备连上来：等同「没有投屏」，继续走正常前台抓取
+        # （否则开着「连接」窗就把眼睛彻底堵死了，PC 上的游戏/视频也看不见）
+        now = time.time()
+        if now - _STANDBY_LAST[0] > 300:
+            _STANDBY_LAST[0] = now
+            log.info('投屏接收端待机中（%s），先看前台窗口', tablet[1])
+        tablet = None
     if tablet:
         proc, title, rect, standby = tablet
-        if standby:
-            # 「连接」接收端开着但还没有设备连上来 —— 别抓那张静态待机画面
-            now = time.time()
-            if now - _STANDBY_LAST[0] > 300:
-                _STANDBY_LAST[0] = now
-                log.info('投屏接收端待机中（%s），等平板连进来', title)
-            return 'mirror-standby'
         title = ('平板投屏 · ' + title)[:80]
     else:
         info = win_info()
