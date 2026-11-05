@@ -8,6 +8,7 @@
 用法：python wd_pc_body.py        # 常驻循环，60s 一查
       python wd_pc_body.py once   # 单次检查后退出（测试用）
 """
+import os
 import socket
 import subprocess
 import sys
@@ -22,9 +23,11 @@ LOG_FILE = DIR / 'wd_pc_body.log'
 MUTEX_PORT = 17861
 INTERVAL = 60
 
+# 探活地址必须与真实绑定地址一致：桥只绑 Tailscale IP，不监听 127.0.0.1。
+# （探 127.0.0.1 会永远 DOWN → 每 65s 白拉一个抢不到端口的影子进程）
 CHECKS = [
-    (7340, [str(NODE), 'lib/standalone.js', '--port', '7340']),
-    (17860, [str(PYTHON), 'pc_body.py']),
+    ('127.0.0.1', 7340, [str(NODE), 'lib/standalone.js', '--port', '7340']),
+    (os.environ.get('BRIDGE_BIND', '100.64.0.1'), 17860, [str(PYTHON), 'pc_body.py']),
 ]
 CREATE_FLAGS = 0x00000008 | 0x00000200        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 
@@ -39,11 +42,11 @@ def log(msg):
     print(line, flush=True)
 
 
-def alive(port):
+def alive(host, port):
     s = socket.socket()
     s.settimeout(2)
     try:
-        s.connect(('127.0.0.1', port))
+        s.connect((host, port))
         return True
     except OSError:
         return False
@@ -58,13 +61,13 @@ def spawn(cmd):
 
 
 def check_pass():
-    for port, cmd in CHECKS:
-        if alive(port):
+    for host, port, cmd in CHECKS:
+        if alive(host, port):
             continue
         time.sleep(1.5)          # 复检：瞬时探活误判会导致重复拉起（Windows 双绑坑）
-        if alive(port):
+        if alive(host, port):
             continue
-        log('DOWN :%d -> 拉起 %s' % (port, ' '.join(cmd[1:])))
+        log('DOWN %s:%d -> 拉起 %s' % (host, port, ' '.join(cmd[1:])))
         try:
             spawn(cmd)
         except Exception as e:
