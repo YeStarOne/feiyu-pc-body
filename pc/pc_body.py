@@ -26,6 +26,8 @@ import json
 import logging
 import os
 import queue
+import re as _re
+import subprocess
 import sys
 import threading
 import time
@@ -87,6 +89,16 @@ MIRROR_STANDBY_TITLES = ['无线显示器', '连接', 'connect', 'wireless displ
 _STANDBY_LAST = [0.0]                               # 待机日志节流
 _OCCLUDE_LAST = [0.0]                               # 遮挡日志节流
 _SCREEN_AREA = []                                   # 首次用到时求值（user32 在后面才定义）
+
+# ── 平板 hdc 直连眼（USB，最高优先级）────────────────────────
+# HarmonyOS NEXT 没有 adb，hdc 是唯一设备调试通道。hdc.exe 从 Hadice 便携版提取
+# （官方 OpenHarmony 3.2 二进制，实测兼容 NEXT 7.0 设备）。
+# ⚠️ `hdc file recv` 与 NEXT 7 的文件传输协议不兼容（一跑通道就卡死），
+#    截屏回传必须走 `snapshot_display + base64 stdout`（实测 1.05s/帧，无损）。
+HDC_EXE = BASE_DIR / 'bin' / 'hdc' / 'hdc.exe'
+HDC_SNAP_PATH = '/data/local/tmp/_eye.jpeg'
+HDC_CREATE_NO_WINDOW = 0x08000000
+HDC_STATE = {'key': '', 'ok_at': 0.0, 'fail': 0}   # key 缓存 10min，失败连击不刷日志
 
 user32 = ctypes.windll.user32
 # ⚠️ 必须在任何 GetWindowRect/GetSystemMetrics 之前声明 DPI 感知：
@@ -366,6 +378,107 @@ def push_frames(payload):
     raise RuntimeError(last_err or 'all routes failed')
 
 
+def shrink_jpeg(jb, target_w=None, quality=None):
+    """压到 PC 眼睛同口径（TARGET_W 宽 / JPEG_Q）。平板原始截屏 1920×2880≈270KB，
+    直接推 = PC 路径 10 倍 token，必须统一压完再进 diff/push（口径一致帧差才准）"""
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(jb)).convert('RGB')
+        ratio = min(1.0, (target_w or TARGET_W) / img.width)
+        nw, nh = max(1, int(img.width * ratio)), max(1, int(img.height * ratio))
+        img = img.resize((nw, nh), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, 'JPEG', quality=(quality or JPEG_Q), optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return jb
+
+
+def jpeg_wh(jb):
+    """读 JPEG 尺寸（解析 SOF0/SOF2 段），不引 PIL——hdc 通道只在成功时调用"""
+    try:
+        import struct
+        i = 2
+        while i + 9 < len(jb):
+            if jb[i] != 0xFF:
+                i += 1
+                continue
+            marker = jb[i + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3):   # SOF0/1/2/3
+                h, w = struct.unpack('>HH', jb[i + 5:i + 9])
+                return w, h
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            i += 2 + struct.unpack('>H', jb[i + 2:i + 4])[0]
+    except Exception:
+        pass
+    return 0, 0
+
+
+def hdc_target():
+    """平板 hdc 连接键（未插/未授权/服务卡死都返回 None）。结果缓存 10 分钟，
+    失败时清缓存逼着重查——设备在列表里抖是常态，别每轮都刷日志。"""
+    if HDC_STATE['key'] and time.time() - HDC_STATE['ok_at'] < 600:
+        return HDC_STATE['key']
+    try:
+        r = subprocess.run([str(HDC_EXE), 'list', 'targets'], capture_output=True,
+                           timeout=10, creationflags=HDC_CREATE_NO_WINDOW)
+        lines = [l.strip() for l in r.stdout.decode('utf-8', 'replace').splitlines() if l.strip()]
+        if lines and lines[0] != '[Empty]':
+            HDC_STATE['key'] = lines[0]
+            HDC_STATE['ok_at'] = time.time()
+            HDC_STATE['fail'] = 0
+            log.info('平板 hdc 在线: %s', lines[0])
+            return lines[0]
+    except Exception:
+        pass
+    HDC_STATE['key'] = ''
+    return None
+
+
+def hdc_snapshot(key):
+    """平板截屏一帧。snapshot_display 落设备 tmp，base64 走 stdout 拉回
+    （file recv 协议不兼容会把 hdc 通道搞死，绝对别用）。返回 jpeg bytes 或 None"""
+    try:
+        r = subprocess.run([str(HDC_EXE), '-t', key, 'shell',
+                            'snapshot_display -f ' + HDC_SNAP_PATH],
+                           capture_output=True, timeout=15,
+                           creationflags=HDC_CREATE_NO_WINDOW)
+        if b'success' not in r.stdout + r.stderr:
+            return None
+        r = subprocess.run([str(HDC_EXE), '-t', key, 'shell', 'base64 ' + HDC_SNAP_PATH],
+                           capture_output=True, timeout=25,
+                           creationflags=HDC_CREATE_NO_WINDOW)
+        clean = _re.sub(rb'[^A-Za-z0-9+/=]', b'', r.stdout)
+        if len(clean) < 1000:
+            return None
+        return base64.b64decode(clean + b'=' * (-len(clean) % 4))
+    except Exception:
+        return None
+
+
+def hdc_frames(count=3, gap=2.0):
+    """平板连拍 count 帧（帧间 gap 秒）。任一帧失败即放弃整轮——半截 payload 没意义"""
+    key = hdc_target()
+    if not key:
+        return None
+    out = []
+    for i in range(count):
+        jb = hdc_snapshot(key)
+        if not jb or not jb.startswith(b'\xff\xd8'):
+            HDC_STATE['fail'] += 1
+            if HDC_STATE['fail'] in (1, 3, 10, 30):     # 节流日志
+                log.warning('hdc 截屏失败 x%d（拔插一次 USB 或重启平板可解）', HDC_STATE['fail'])
+            return None
+        out.append(jb)
+        if i < count - 1:
+            time.sleep(gap)
+    HDC_STATE['fail'] = 0
+    return out
+
+
 def eye_round():
     with LOCK:
         if STATE['paused']:
@@ -378,32 +491,55 @@ def eye_round():
             STATE['pause_reason'] = 'daily-limit-local'
             log.warning('闸2 触发: 日限额 %dMB 用完，眼睛暂停', DAILY_LIMIT // 1048576)
             return 'daily-limit'
-    # 平板投屏优先：投屏窗口存在 = 主人在平板上看视频，抓它（不管 PC 前台是什么）
-    tablet = find_mirror_window()
-    if tablet and tablet[3]:
-        # 接收端开着但没设备连上来：等同「没有投屏」，继续走正常前台抓取
-        # （否则开着「连接」窗就把眼睛彻底堵死了，PC 上的游戏/视频也看不见）
-        now = time.time()
-        if now - _STANDBY_LAST[0] > 300:
-            _STANDBY_LAST[0] = now
-            log.info('投屏接收端待机中（%s），先看前台窗口', tablet[1])
-        tablet = None
-    if tablet:
-        proc, title, rect, standby = tablet
-        title = ('平板投屏 · ' + title)[:80]
+    # 0) 平板 hdc 直连（USB，最高优先级）：先拍一帧探动静——平板有动静才走这条
+    #    通道（否则插着充电的平板会把 PC 前台的眼睛永久顶掉）
+    tab_jpeg, tab_key = None, hdc_target()
+    if tab_key:
+        tab_jpeg = shrink_jpeg(hdc_snapshot(tab_key) or b'')
+        if tab_jpeg and tab_jpeg.startswith(b'\xff\xd8'):
+            if frame_diff(STATE.get('last_jpeg'), tab_jpeg) < DIFF_THRESHOLD:
+                tab_jpeg = None          # 平板画面没动 = 没人在平板上看东西
+        else:
+            tab_jpeg = None
+
+    if tab_jpeg:
+        jpegs = [tab_jpeg]
+        for _ in range(2):               # 补齐 3 帧（与 PC 眼睛口径一致）
+            time.sleep(2.0)
+            jb = shrink_jpeg(hdc_snapshot(tab_key) or b'')
+            if jb.startswith(b'\xff\xd8'):
+                jpegs.append(jb)
+        proc, title, app_type = 'hdc.exe', '平板屏幕 · hdc(USB)', 'video'
+        frames = [(jb,) + jpeg_wh(jb) for jb in jpegs]
     else:
-        info = win_info()
-        if not info:
-            return 'no-window'
-        hwnd, pid, proc, title, rect = info
-        if blacklisted(proc, title):
-            return 'blacklisted'
-    # 抓帧
-    try:
-        frames = grab_frames(rect)
-    except Exception as e:
-        log.warning('grab fail: %s', e)
-        return 'grab-fail'
+        # 平板投屏优先：投屏窗口存在 = 主人在平板上看视频，抓它（不管 PC 前台是什么）
+        tablet = find_mirror_window()
+        if tablet and tablet[3]:
+            # 接收端开着但没设备连上来：等同「没有投屏」，继续走正常前台抓取
+            # （否则开着「连接」窗就把眼睛彻底堵死了，PC 上的游戏/视频也看不见）
+            now = time.time()
+            if now - _STANDBY_LAST[0] > 300:
+                _STANDBY_LAST[0] = now
+                log.info('投屏接收端待机中（%s），先看前台窗口', tablet[1])
+            tablet = None
+        if tablet:
+            proc, title, rect, standby = tablet
+            title = ('平板投屏 · ' + title)[:80]
+            app_type = 'video'
+        else:
+            info = win_info()
+            if not info:
+                return 'no-window'
+            hwnd, pid, proc, title, rect = info
+            if blacklisted(proc, title):
+                return 'blacklisted'
+            app_type = app_type_of(proc)
+        # 抓帧
+        try:
+            frames = grab_frames(rect)
+        except Exception as e:
+            log.warning('grab fail: %s', e)
+            return 'grab-fail'
     if len(frames) < 2:
         return 'too-small'
     # 闸帧差：上一轮最后一张 vs 本轮最后一张
@@ -422,7 +558,7 @@ def eye_round():
     if total > MAX_ROUND_BYTES:
         log.warning('闸1 触发: 本轮 %dKB 超硬顶，丢弃', total // 1024)
         return 'too-big'
-    meta = {'window': title[:80], 'process': proc, 'app_type': app_type_of(proc),
+    meta = {'window': title[:80], 'process': proc, 'app_type': app_type,
             'frame_count': len(payload_frames), 'diff': round(diff, 3)}
     # 推送
     try:
@@ -691,7 +827,8 @@ class Bridge(BaseHTTPRequestHandler):
                 pet_ok = False
                 pet = {'error': str(e)[:100]}
             return self._json({'ok': True, 'eye': eye_state, 'pet_alive': pet_ok,
-                               'tablet_window': tablet_state})
+                               'tablet_window': tablet_state,
+                               'tablet_hdc': 'yes' if hdc_target() else 'no'})
         return self._json({'error': 'not-found'}, 404)
 
     def do_POST(self):

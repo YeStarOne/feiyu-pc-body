@@ -16,3 +16,4 @@ package-lock.json
 # 杂物
 __pycache__/
 *.pyc
+bin/

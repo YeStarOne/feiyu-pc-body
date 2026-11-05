@@ -108,19 +108,28 @@ AGENTS.md（她的角色卡）里建议写明：不是每条笔记都要 `pet_sa
 
 她在平板上"陪你追剧"由两条链路拼成，**零安卓开发**：
 
-**眼睛——投屏到 PC（PC 自动优先抓，三通道通吃）**
+**眼睛——四条通道，按优先级自动选**
 
-pc_body 认三种投屏窗口，哪条通就用哪条，谁先出现抓谁：
+| 优先级 | 通道 | 适用 | 起法 |
+|---|---|---|---|
+| ① | **hdc 直连（USB）** | 纯血鸿蒙（HarmonyOS NEXT，无 adb）+ 标准安卓 | 数据线插 PC，开发者模式开 USB 调试。**插着即用，什么都不用点** |
+| ② | Windows 无线显示器（Miracast） | 安卓 / 鸿蒙都行，零线 | Win+K 开「连接」窗，平板下拉控制中心→无线投屏→选这台电脑 |
+| ③ | scrcpy（adb） | 标准安卓 | USB 调试 → `scrcpy --no-audio --stay-awake` |
+| ④ | 华为电脑管家多屏协同 | 华为 PC + 华为平板 | 管家 → 多屏协同 |
 
-| 通道 | 适用 | 起法 |
-|---|---|---|
-| **Windows 无线显示器（Miracast）** | 安卓 / **纯血鸿蒙**都能用，零 APK 零线 | Win+K 开「连接」窗，平板下拉控制中心→无线投屏→选这台电脑 |
-| scrcpy（adb） | 标准安卓（有 ADB 接口） | USB 调试 → `scrcpy --no-audio --stay-awake` |
-| 华为电脑管家多屏协同 | 华为 PC + 华为平板 | 管家 → 多屏协同 |
+hdc 直连的原理：`hdc shell snapshot_display` 截平板屏（1920×2880）→ 设备端 `base64` 走
+stdout 拉回（`hdc file recv` 与 NEXT 7 文件协议不兼容，一跑就卡死通道）→ PC 压到 800 宽
+与 PC 眼睛同口径。实测 1.05s/帧、3 帧 5.6s。**每轮先拍平板一帧探动静：画面在动才走平板
+通道，静止就自动回看 PC 前台**——平板插着充电也不会顶掉 PC 眼睛。
 
-任意一条通了，pc_body 每轮**优先抓投屏窗口**（不管 PC 前台是什么，主人在看平板也不影响），
-`app_type=video`，eye-server 切到「陪看视频」提示词（朋友追剧语气）。她就"坐进"你的视频里了：
-`game_eye` 能翻出刚才的剧情笔记，想吐槽就 `pet_say`。
+平板侧一次性设置（HarmonyOS NEXT）：`设置→关于本机→连点版本号 7 次`（5.x 需重启生效）→
+`设置→系统和更新→开发人员选项→USB 调试` 开启。Windows 侧需要 hdc.exe：官方不给独立
+下载，从 [Hadice 便携版](https://github.com/HuolalaTech/hadice/releases)（20MB）解压拿
+`bin/hdc/hdc.exe + libusb_shared.dll`（官方 OpenHarmony 3.2 二进制，实测兼容 NEXT 7.0），
+放到 pc_body 同目录的 `bin/hdc/` 下即可。平板插上后 `/health` 的 `tablet_hdc` 变 `"yes"`。
+
+任意通道通了，`app_type=video`，eye-server 切到「陪看视频」提示词（朋友追剧语气）。
+她就"坐进"你的视频里了：`game_eye` 能翻出刚才的剧情笔记，想吐槽就 `pet_say`。
 
 注意：
 
@@ -130,6 +139,10 @@ pc_body 认三种投屏窗口，哪条通就用哪条，谁先出现抓谁：
   待机画面（白烧 token）。设备投上来窗口铺满 → 自动变 `"yes"`，不用重启。
 - 走 Miracast 前 PC 要确认：`设置→系统→投影到此电脑` 允许，且 Wi-Fi 网络类别不是「公用」
   （公用网络下不广播，平板搜不到）。
+- ⚠️ **hdc 设备在 `list targets` 里时有时无、shell 报 "communication channel is being
+  established" 都是正常握手抖动**，重试即可；真卡死 `hdc kill` 重启守护进程立刻恢复。
+- 平板想脱线：开发者选项里有「无线调试」，`hdc tconn <平板IP>:<端口>` 可转 WiFi
+  （USB 首配对后生效）。
 
 **桌宠——平板浏览器开一个页面（不装任何 APK）**
 
