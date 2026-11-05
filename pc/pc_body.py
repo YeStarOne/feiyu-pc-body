@@ -85,9 +85,21 @@ MIRROR_TITLE_KW = ['MatePad', 'HUAWEI', '投屏', '协同', '无线显示器', '
 MIRROR_STANDBY_TITLES = ['无线显示器', '连接', 'connect', 'wireless display']
 # ↑ 接收端「待机界面」的标题：窗口这么小说明没设备连着，抓了就是蓝屏白烧 token
 _STANDBY_LAST = [0.0]                               # 待机日志节流
+_OCCLUDE_LAST = [0.0]                               # 遮挡日志节流
 _SCREEN_AREA = []                                   # 首次用到时求值（user32 在后面才定义）
 
 user32 = ctypes.windll.user32
+# ⚠️ 必须在任何 GetWindowRect/GetSystemMetrics 之前声明 DPI 感知：
+# 否则进程是 DPI-unaware 的（150% 缩放下 GetWindowRect 返回 2560 空间坐标），
+# 而 mss 内部会把自己切成 DPI-aware 抓 3840 物理像素 —— 两套坐标系混用，
+# 抓出来的区域整个错位（11-05 实锤：抓成了压在接收端窗口上面的 SMAPI 控制台）。
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)      # PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
 logging.basicConfig(
     handlers=[logging.FileHandler(LOG_FILE, encoding='utf-8'),
               logging.StreamHandler(sys.stdout)],
@@ -171,6 +183,57 @@ def screen_area():
     return _SCREEN_AREA[0]
 
 
+def monitors():
+    """当前激活的显示器 [(device, (x, y, w, h), is_primary)]"""
+    mons = []
+
+    class _MI(ctypes.Structure):
+        _fields_ = [('cbSize', wt.DWORD), ('rcMonitor', wt.RECT), ('rcWork', wt.RECT),
+                    ('dwFlags', wt.DWORD), ('szDevice', ctypes.c_wchar * 32)]
+
+    try:
+        @ctypes.WINFUNCTYPE(wt.BOOL, wt.HMONITOR, wt.HDC, ctypes.POINTER(wt.RECT), wt.LPARAM)
+        def cb(h, hdc, r, l):
+            mi = _MI()
+            mi.cbSize = ctypes.sizeof(_MI)
+            if user32.GetMonitorInfoW(h, ctypes.byref(mi)):
+                m = mi.rcMonitor
+                mons.append((mi.szDevice, (m.left, m.top, m.right - m.left, m.bottom - m.top),
+                             bool(mi.dwFlags & 1)))
+            return True
+        user32.EnumDisplayMonitors(None, None, cb, 0)
+    except Exception:
+        pass
+    return mons
+
+
+def covers_monitor(rect):
+    """窗口是否基本铺满某块显示器。真投上来时接收端会全屏（Miracast 还会新挂一块
+    虚拟显示器）；待机时只是个小窗——用面积判死比标题可靠。"""
+    x, y, w, h = rect
+    for _dev, (mx, my, mw, mh), _p in monitors():
+        if mw <= 0 or mh <= 0:
+            continue
+        ix = max(0, min(x + w, mx + mw) - max(x, mx))
+        iy = max(0, min(y + h, my + mh) - max(y, my))
+        if ix * iy >= 0.92 * mw * mh:
+            return True
+    return False
+
+
+def window_on_top(hwnd, rect):
+    """窗口是否在抓取区域最上层。被别的窗口盖住时 mss 抓到的是**别人**
+    （11-05 实锤：接收端待机窗被 SMAPI 控制台盖住，抓出来全是 mod 日志）。"""
+    try:
+        pt = wt.POINT(rect[0] + rect[2] // 2, rect[1] + rect[3] // 2)
+        h = user32.WindowFromPoint(pt)
+        if not h:
+            return False
+        return h == hwnd or user32.GetAncestor(h, 2) == hwnd   # GA_ROOT=2
+    except Exception:
+        return True
+
+
 def find_mirror_window():
     """找平板投屏窗口（scrcpy / 华为多屏协同 / 无线显示器）——优先于前台窗口：
     主人看平板时 PC 不必在前台。返回 (proc, title, rect) 或 None"""
@@ -208,13 +271,22 @@ def find_mirror_window():
                 w, hh = r.right - r.left, r.bottom - r.top
                 # 最小化窗口的 rect 在 (-32000,-32000)，抓了是黑帧——跳过
                 if w > 200 and hh > 150 and r.left > -500 and r.top > -500:
-                    # 待机界面 = 还没设备连进来（抓了就是一张静态蓝屏）。
-                    # 判据 = 标题命中「待机」且窗口没铺满屏幕；真正投上来时
-                    # Miracast 会新建虚拟显示器并把接收端铺满，窗口面积会暴涨。
-                    standby = (any(s in title.lower() for s in MIRROR_STANDBY_TITLES)
-                               and w * hh < 0.55 * screen_area())
-                    found.append((proc, title or '平板投屏', (r.left, r.top, w, hh), standby))
-                    log.debug('mirror cand: %s | %s | %dx%d standby=%s', proc, title, w, hh, standby)
+                    rect = (r.left, r.top, w, hh)
+                    # 待机判据（2026-11-05 重写）：窗口面积不重要，重要的是
+                    # 「这块区域当前最上层是不是它」。待机小窗常被别的窗口盖住，
+                    # mss 抓到的是压在上面的那个（实锤：抓成了 SMAPI 控制台日志）。
+                    if not covers_monitor(rect):
+                        # 没铺满任何显示器 = 还没投上来（待机/小窗状态）
+                        found.append((proc, title or '平板投屏', rect, True))
+                    elif not window_on_top(h, rect):
+                        # 铺满了但被别的窗口盖着 —— 抓了就是别人的画面，跳过
+                        now = time.time()
+                        if now - _OCCLUDE_LAST[0] > 300:
+                            _OCCLUDE_LAST[0] = now
+                            log.info('投屏窗口被遮挡（%s），本轮跳过', title or proc)
+                    else:
+                        found.append((proc, title or '平板投屏', rect, False))
+                    log.debug('mirror cand: %s | %s | %dx%d', proc, title, w, hh)
             except Exception:
                 pass
             return True
